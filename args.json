@@ -1,0 +1,13 @@
+{
+    "nepochs":100,
+    "nbatchs":512,
+    "nbatchs_per_ep":2500,
+    "nbatchs_per_ev":50,
+    "nnodes":10,
+    "nheads":8,
+    "embed_size":128,
+    "nlayersENC":6,
+    "nlayersDEC":2,
+    "lenPE":1000,
+    "lr":1e-4
+ }
