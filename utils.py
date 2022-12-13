@@ -1,26 +1,97 @@
+from scipy import stats
+import numpy as np
 import torch
-import matplotlib.pyplot as plt
 
-def cost(x, xsol):
-    nbatchs, nnodes, _ = x.size()
-    idkw = torch.arange(nbatchs)
-    xf = x[idkw, xsol[:, 0], :]
-    xprev = xf
-    
-    cost = torch.zeros(nbatchs)
-    for i in range(1, nnodes):
-        xcurr = x[idkw, xsol[:, i], :]
-        cost = cost + torch.norm(xcurr-xprev, p=2)
-        xprev = xcurr
-    
-    cost += torch.norm(xf-xprev, p=2)
-    return cost
 
-def draw(x, xsol, ax, title=None):
-    ax.plot(x[0, xsol[0,:], 0], x[0, xsol[0,:], 1], "r-o")
+def cost(graphs, permutations):
+    """copied from https://github.com/wouterkool/attention-learn-to-route"""
+    d = graphs.gather(1, permutations.unsqueeze(-1).expand_as(graphs))
+    return (
+        (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2).sum(1)
+        + (d[:, 0] - d[:, -1]).norm(p=2, dim=1)
+    ).view(-1, 1)
+
+
+def draw(x, solution, ax):
+    ax.plot(x[0, solution[0, :], 0], x[0, solution[0, :], 1], "r-o")
     ax.plot(
-        [x[0, xsol[0,0], 0], x[0, xsol[0,-1], 0]],
-        [x[0, xsol[0,0], 1], x[0, xsol[0,-1], 1]], "r-o"
+        [x[0, solution[0, 0], 0], x[0, solution[0, -1], 0]],
+        [x[0, solution[0, 0], 1], x[0, solution[0, -1], 1]],
+        "r-o",
     )
-    ax.set_title(title)
     ax.axis(False)
+
+
+class Trainer:
+    def __init__(self, args, dtype, device) -> None:
+        self.num_batchs = args["num_batchs"]
+        self.num_instances_per_batchs = args["num_instances_per_batchs"]
+        self.num_nodes = args["num_nodes"]
+        self.embed_size = args["embed_size"]
+        self.num_heads = args["num_heads"]
+        self.device = device
+        self.dtype = dtype
+
+    def train(self, epoch, models, optim):
+        model, greedy = models
+        model.train()
+        train_loss = 0.0
+        for batch in range(self.num_batchs):
+            x = torch.rand(
+                size=(self.num_instances_per_batchs, self.num_nodes, 2),
+                device=self.device,
+                dtype=self.dtype,
+            )
+            solutions, lprobs = model(x)
+            with torch.no_grad():
+                greedy.eval()
+                c1 = cost(x, solutions)
+                solutions, _ = greedy(x)
+                c2 = cost(x, solutions)
+
+            loss = (c1 - c2) * lprobs
+            loss = torch.mean(loss)
+
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+
+            train_loss += loss.item()
+            if not batch%10: 
+                print(
+                    "<TRAIN> EPOCH: {:d} BATCH: {:d}/{} LOSS: {:>7f}".format(
+                        epoch,
+                        batch * self.num_instances_per_batchs,
+                        self.num_batchs * self.num_instances_per_batchs,
+                        loss.item(),
+                    )
+                )
+
+        train_loss /= self.num_batchs
+        print("<TRAIN ERROR> EPOCH: {:d} AVG LOSS: {:>7f}".format(epoch, train_loss))
+        return train_loss
+
+    @torch.no_grad()
+    def test(self, epoch, models, optim):
+        model, greedy = models
+        model.eval()
+        greedy.eval()
+
+        sols1, sols2 = [], []
+        x = torch.rand(
+            size=(1000, self.num_nodes, 2), device=self.device, dtype=self.dtype
+        )
+        s1, _ = model(x)
+        s2, _ = greedy(x)
+        sols1 += [cost(x, s1).cpu().numpy()]
+        sols2 += [cost(x, s2).cpu().numpy()]
+        sols1 = np.concatenate(sols1).reshape(-1)
+        sols2 = np.concatenate(sols2).reshape(-1)
+        _, p_value = stats.ttest_rel(sols1, sols2)
+        loss = (sols1 - sols2).mean()
+        improve = loss >= 0
+        if improve and p_value <= 0.05:
+            greedy.load_state_dict(model.state_dict())
+
+        print("<TEST ERROR> EPOCH: {:d} AVG LOSS: {:>7f}".format(epoch, loss))
+        return loss

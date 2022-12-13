@@ -1,247 +1,156 @@
 import torch
-from torch import nn, distributions
+from torch import nn
 
+dtype = torch.float
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(
+        self,
+        num_heads,
+        q_embed_size,
+        k_embed_size=None,
+        v_embed_size=None,
+    ) -> None:
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.q_embed_size = q_embed_size
+        self.k_embed_size = k_embed_size if k_embed_size is not None else q_embed_size
+        self.v_embed_size = v_embed_size if v_embed_size is not None else q_embed_size
+        self.prjQ = nn.Linear(self.q_embed_size, 16 * num_heads, bias=False)
+        self.prjK = nn.Linear(self.k_embed_size, 16 * num_heads, bias=False)
+        self.prjVinp = nn.Linear(self.v_embed_size, 16 * num_heads, bias=False)
+        self.prjVout = nn.Linear(16 * num_heads, self.v_embed_size, bias=False)
+
+    def forward(self, Q, K=None, V=None, mask=None, clip=None):
+        if K is None and V is None:
+            K = Q.detach().clone()
+            V = Q.detach().clone()
+
+        num_batchs, num_nodes, _ = Q.size()
+        # assert (
+        # 	not num_batchs%self.num_heads
+        # ), "The embedding size has to be a multiple of the number of heads."
+
+        # size(num_batchs, num_heads, num_nodes, 16)
+        Q = torch.stack(torch.chunk(self.prjQ(Q), self.num_heads, dim=-1), dim=1)
+        K = torch.stack(torch.chunk(self.prjK(K), self.num_heads, dim=-1), dim=1)
+        V = torch.stack(torch.chunk(self.prjVinp(V), self.num_heads, dim=-1), dim=1)
+
+        U = torch.matmul(Q, K.transpose(2, 3)) / 16**0.5
+
+        if clip is not None:
+            U = clip * torch.tanh(U)
+
+        if mask is not None:
+            mask = mask.unsqueeze(1).unsqueeze(1)
+            U = U.masked_fill(mask, float("-inf"))
+
+        U_prob = torch.softmax(U, dim=-1)
+        U = torch.matmul(U_prob, V)
+        U = U.transpose(1, 2).reshape(num_batchs, num_nodes, self.num_heads * 16)
+        U = self.prjVout(U)
+        return U
+
 
 class Encoder(nn.Module):
     def __init__(
         self,
-        nlayers,
+        num_layers,
         embed_size,
-        nheads,
+        num_heads,
     ) -> None:
         super(Encoder, self).__init__()
-        self.nlayers = nlayers
-
-        self.mha = nn.ModuleList(
-            nn.MultiheadAttention(embed_size, nheads, bias=False, batch_first=True)
-            for _ in range(nlayers)
+        self.num_layers = num_layers
+        self.embedding = nn.Linear(2, embed_size)
+        self.attention = nn.ModuleList(
+            [MultiHeadAttention(num_heads, embed_size) for _ in range(num_layers)]
         )
-        self.lin = nn.ModuleList(
-            nn.Linear(embed_size, embed_size) for _ in range(nlayers)
-        )
-        self.lin1 = nn.ModuleList(
-            nn.Linear(embed_size, embed_size) for _ in range(nlayers)
-        )
-        self.lin2 = nn.ModuleList(
-            nn.Linear(embed_size, embed_size) for _ in range(nlayers)
-        )
-        self.bn = nn.ModuleList(nn.BatchNorm1d(embed_size) for _ in range(nlayers))
+        self.bn = nn.ModuleList([nn.BatchNorm1d(embed_size) for _ in range(num_layers)])
 
-    def forward(self, h):
-        for i in range(self.nlayers):
-            h = h + self.mha[i](h, h, h)[0]
-            h = h.permute(1, 2, 0).contiguous()
-            h = self.bn[i](h).transpose(1, 2).contiguous()
+    def forward(self, x):
+        h = self.embedding(x)  # size(num_batchs, num_nodes, embed_size)
+        for i in range(self.num_layers):
+            h = h + self.attention[i](h)
+            size = h.size()
+            # size(num_batchs * num_nodes, embed_size)
+            h = h.view(-1, size[-1])
+            h = self.bn[i](h)
+            h = h.view(*size)  # size(num_batchs, num_nodes, embed_size)
 
-            h = h + self.lin2[i](torch.relu(self.lin1[i](h)))
-            h = h.permute(1, 2, 0).contiguous()
-            h = self.bn[i](h).transpose(1, 2).contiguous()
-
-        return h
-
-
-class MHA(nn.Module):
-    def __init__(
-        self,
-        nheads,
-    ) -> None:
-        super(MHA, self).__init__()
-        self.nheads = nheads
-
-    def forward(self, query, key, value, mask=None, clip=None):
-        nbatchs, nnodes, embed_size = query.size()
-        assert (
-            not embed_size % self.nheads
-        ), "The embedding size has to be a multiple of the number of heads."
-
-        query, key, value = [
-            x.transpose(1, 2)
-            .contiguous()
-            .view(nbatchs * self.nheads, embed_size // self.nheads, nh)
-            .transpose(1, 2)
-            .contiguous()
-            for x, nh in zip(
-                (query, key, value), (query.size(1), key.size(1), value.size(1))
-            )
-        ]
-
-        qk = torch.bmm(query, key.transpose(1, 2)) / (embed_size // self.nheads) ** 0.5
-
-        if clip is not None:
-            qk = clip * torch.tanh(qk)
-        
-        if mask is not None:
-            mask = mask.repeat_interleave(repeats=self.nheads, dim=0) if self.nheads>1 else mask
-            qk = qk.masked_fill(mask.unsqueeze(1), float("-1e20"))
-
-        attn_prob = torch.softmax(qk, dim=-1)
-        attn = torch.bmm(attn_prob, value)
-
-        if self.nheads>1:
-            attn = attn.transpose(1,2).contiguous().view(nbatchs, embed_size, nnodes).transpose(1,2).contiguous()
-            attn_prob = attn_prob.view(nbatchs, self.nheads, 1, key.size(1)).mean(dim=1)
-        return attn, attn_prob
-
-
-class ARD(nn.Module):
-    def __init__(
-        self,
-        embed_size,
-        nheads,
-    ) -> None:
-        super(ARD, self).__init__()
-        self.kprev = None
-        self.vprev = None
-        self.lin = nn.ModuleList(nn.Linear(embed_size, embed_size) for _ in range(8))
-        self.mha = MHA(nheads).to(device)
-        self.bn = nn.ModuleList(nn.LayerNorm(embed_size) for _ in range(3))
-
-    def reset(self):
-        self.kprev = None
-        self.vprev = None
-
-    def forward(self, ht, key, value, mask):
-        ht = ht.view(ht.size(0), 1, -1)
-        q = self.lin[0](ht)
-        k = self.lin[1](ht)
-        v = self.lin[2](ht)
-
-        if self.kprev is None:
-            self.kprev = k
-            self.vprev = v
-        else:
-            self.kprev = torch.cat((self.kprev, k), dim=1)
-            self.vprev = torch.cat((self.vprev, v), dim=1)
-
-        # STEP (2)
-        ht = ht + self.lin[3](self.mha(q, self.kprev, self.vprev, mask=None)[0])
-        ht = self.bn[0](ht.squeeze()).view(ht.size(0), 1, -1)
-
-        # STEP (3)
-        query = self.lin[4](ht)
-        ht = ht + self.lin[5](self.mha(query, key, value, mask, clip=None)[0])
-        ht = self.bn[1](ht.squeeze(1)).view(ht.size(0), 1, -1)
-
-        ht = ht + self.lin[6](torch.relu(self.lin[7](ht)))
-        ht = self.bn[2](ht.squeeze(1))
-        return ht
+        return h  # size(num_batchs, num_nodes, embed_size)
 
 
 class Decoder(nn.Module):
     def __init__(
         self,
-        nlayers,
         embed_size,
-        nheads,
+        num_heads,
+        greedy,
     ) -> None:
         super(Decoder, self).__init__()
-        self.embed_size = embed_size
-        self.nlayers = nlayers
-
-        self.lin = nn.Linear(embed_size, embed_size)
-        self.ard = nn.ModuleList(ARD(embed_size, nheads).to(device) for _ in range(nlayers))
-        self.mha = MHA(nheads).to(device)
-
-    def reset(self):
-        for i in range(self.nlayers):
-            self.ard[i].reset()
-
-    def forward(self, query, key, value, mask, clip):
-        for i in range(self.nlayers):
-            kl = key[:, :, (i) * self.embed_size : (i + 1) * self.embed_size]
-            vl = value[:, :, (i) * self.embed_size : (i + 1) * self.embed_size]
-
-            if i == self.nlayers - 1:
-                ht = self.lin(ht).unsqueeze(1)
-                _, ht_prob = self.mha(ht, kl, vl, mask, clip=clip)
-            else:
-                ht = self.ard[i](query, kl, vl, mask)
-        return ht_prob.squeeze(1)
-
-
-class TSP(nn.Module):
-    def __init__(
-        self,
-        nbatchs,
-        nnodes,
-        embed_size,
-        lenPE,
-        nheads,
-        nlayersENC,
-        nlayersDEC,
-        mode,
-    ) -> None:
-        super(TSP, self).__init__()
-        self.embed_size = embed_size
-        self.nnodes = nnodes
-        self.nbatchs = nbatchs
-        self.lenPE = lenPE
-        self.mode = mode
-
-        self.enc = Encoder(nlayersENC, embed_size, nheads).to(device)
-        self.dec = Decoder(nlayersDEC, embed_size, nheads).to(device)
-
-        self.Wk = nn.Linear(embed_size, embed_size * nlayersDEC)
-        self.Wv = nn.Linear(embed_size, embed_size * nlayersDEC)
-
-        self.lin = nn.Linear(2, embed_size)
-        self.h_init = nn.Parameter(torch.randn(embed_size))
-
-    def _positional_encoding(self):
-        t = torch.arange(0, self.lenPE).unsqueeze(1)
-        fi = torch.exp(
-            torch.arange(0, self.embed_size, 2)
-            * (-torch.log(torch.tensor(10_000)) / self.embed_size)
+        self.greedy = greedy
+        self.initK = nn.Parameter(
+            torch.empty(size=(1, 1, embed_size), device=device, dtype=dtype).uniform_()
+        )
+        self.initV = nn.Parameter(
+            torch.empty(size=(1, 1, embed_size), device=device, dtype=dtype).uniform_()
+        )
+        self.prjK = nn.Linear(embed_size, embed_size, bias=False)
+        self.attention = MultiHeadAttention(
+            num_heads, embed_size * 3, embed_size, embed_size
         )
 
-        pe = torch.zeros(self.lenPE, self.embed_size)
-        pe[:, 0::2] = torch.sin(t * fi)
-        pe[:, 1::2] = torch.cos(t * fi)
-        return pe
+    def forward(self, x, clip):
+        num_batchs, num_nodes, embed_size = x.size()
 
-    def forward(self, x):
-        idkw = torch.arange(self.nbatchs)
+        hinit = x.mean(dim=-2, keepdim=True)
 
-        henc = self.lin(x)
-        henc = self.enc(henc)
-        henc = torch.cat([henc, self.h_init.repeat(self.nbatchs, 1, 1)], dim=1)
+        last = self.initK.repeat(num_batchs, 1, 1)
+        first = self.initV.repeat(num_batchs, 1, 1)
+        mask = torch.zeros(
+            size=(num_batchs, num_nodes), device=device, dtype=dtype
+        ).bool()
+        logprob = 0.0
+        visited_nodes = []
+        for i in range(x.size(1)):
+            h = torch.cat((hinit, last, first), dim=-1)
 
-        sol, sol_prob = [], []
-        pe = self._positional_encoding()
+            q = self.attention(h, x, x, mask, clip=None)
+            u = clip * torch.tanh(q.bmm(self.prjK(x).transpose(-1, -2) / embed_size))
+            u = u.masked_fill(mask.unsqueeze(1), float("-inf"))
 
-        str_idx = torch.tensor(self.nnodes).expand(self.nbatchs)
+            if self.greedy:
+                next_node = u.argmax(dim=-1)
+            else:
+                m = torch.distributions.Categorical(logits=u)
+                next_node = m.sample()
+                logprob += m.log_prob(next_node)
 
-        # STEP (1)
-        ht = pe[0].repeat(self.nbatchs, 1) + henc[idkw, str_idx, :]
+            visited_nodes.append(next_node)
+            mask = mask.scatter(1, next_node, True)
 
-        k = self.Wk(henc)
-        v = self.Wv(henc)
-        mask = torch.zeros((self.nbatchs, self.nnodes+1)).bool()
-        mask[idkw, str_idx] = True
+            next_node = next_node.unsqueeze(-1).repeat(1, 1, embed_size)
+            last = torch.gather(x, 1, next_node)
+            if len(visited_nodes) == 1:
+                first = last
+        visited_nodes = torch.cat(visited_nodes, -1)
+        return visited_nodes, logprob
 
 
-        self.dec.reset()
+class TSPNet(nn.Module):
+    def __init__(
+        self,
+        embed_size,
+        num_heads,
+        greedy,
+    ) -> None:
+        super(TSPNet, self).__init__()
+        self.encoder = Encoder(10, embed_size, num_heads)
+        self.decoder = Decoder(embed_size, num_heads, greedy=greedy)
 
-        for t in range(self.nnodes):
-            ht = self.dec(
-                ht, k, v, mask, clip=10
-            )  # the probabilities of each node being the next one
-            if self.mode.lower() == "train":
-                nxnode = distributions.Categorical(ht).sample()
-            elif self.mode.lower() == "baseline":
-                nxnode = ht.argmax(dim=1)
-
-            sol.append(nxnode)
-            sol_prob.append(torch.log(ht[idkw, nxnode]))
-
-            ht = henc[idkw, nxnode, :]
-            ht = ht + pe[t + 1].expand(self.nbatchs, self.embed_size)
-
-            mask = mask.clone()
-            mask[idkw, nxnode] = True
-
-        sol_prob = torch.stack(sol_prob, dim=1).sum(dim=1)
-        sol = torch.stack(sol, dim=1)
-        return sol, sol_prob
-
+    def forward(self, instances):
+        out = self.encoder(instances)
+        out = self.decoder(out, clip=10)
+        return out
