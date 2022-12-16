@@ -1,2 +1,5 @@
 torch
 matplotlib
+scipy
+numpy
+yaml
