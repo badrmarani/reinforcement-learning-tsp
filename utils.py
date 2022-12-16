@@ -13,11 +13,11 @@ def cost(graphs, permutations):
 
 
 def draw(x, solution, ax):
-    ax.plot(x[0, solution[0, :], 0], x[0, solution[0, :], 1], "r-o")
+    ax.plot(x[0, solution[0, :], 0], x[0, solution[0, :], 1], "b-o")
     ax.plot(
         [x[0, solution[0, 0], 0], x[0, solution[0, -1], 0]],
         [x[0, solution[0, 0], 1], x[0, solution[0, -1], 1]],
-        "r-o",
+        "b-o",
     )
     ax.axis(False)
 
@@ -32,7 +32,7 @@ class Trainer:
         self.device = device
         self.dtype = dtype
 
-    def train(self, epoch, models, optim):
+    def train(self, epoch, tot_epochs, models, optim):
         model, greedy = models
         model.train()
         train_loss = 0.0
@@ -46,21 +46,24 @@ class Trainer:
             with torch.no_grad():
                 greedy.eval()
                 c1 = cost(x, solutions)
-                solutions, _ = greedy(x)
-                c2 = cost(x, solutions)
+                greedy_solutions, _ = greedy(x)
+                c2 = cost(x, greedy_solutions)
 
             loss = (c1 - c2) * lprobs
             loss = torch.mean(loss)
 
             optim.zero_grad()
             loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
             optim.step()
 
             train_loss += loss.item()
-            if not batch%10: 
+            if not batch % 10:
                 print(
-                    "<TRAIN> EPOCH: {:d} BATCH: {:d}/{} LOSS: {:>7f}".format(
+                    "<TRAIN> EPOCH: {:d}/{:d} BATCH: {:d}/{:d} LOSS: {:>7f}".format(
                         epoch,
+                        tot_epochs,
                         batch * self.num_instances_per_batchs,
                         self.num_batchs * self.num_instances_per_batchs,
                         loss.item(),
@@ -68,30 +71,37 @@ class Trainer:
                 )
 
         train_loss /= self.num_batchs
-        print("<TRAIN ERROR> EPOCH: {:d} AVG LOSS: {:>7f}".format(epoch, train_loss))
-        return train_loss
+        print(
+            "<TRAIN ERROR> EPOCH: {:d}/{:d} AVG LOSS: {:>7f}".format(
+                epoch, tot_epochs, train_loss
+            )
+        )
+        return model, greedy, train_loss
 
     @torch.no_grad()
-    def test(self, epoch, models, optim):
+    def test(self, epoch, tot_epochs, batch_size_val, models, optim):
         model, greedy = models
         model.eval()
         greedy.eval()
 
-        sols1, sols2 = [], []
         x = torch.rand(
-            size=(1000, self.num_nodes, 2), device=self.device, dtype=self.dtype
+            size=(batch_size_val, self.num_nodes, 2),
+            device=self.device,
+            dtype=self.dtype,
         )
         s1, _ = model(x)
         s2, _ = greedy(x)
-        sols1 += [cost(x, s1).cpu().numpy()]
-        sols2 += [cost(x, s2).cpu().numpy()]
-        sols1 = np.concatenate(sols1).reshape(-1)
-        sols2 = np.concatenate(sols2).reshape(-1)
+        sols1 = np.concatenate([cost(x, s1).cpu().numpy()]).reshape(-1)
+        sols2 = np.concatenate([cost(x, s2).cpu().numpy()]).reshape(-1)
         _, p_value = stats.ttest_rel(sols1, sols2)
         loss = (sols1 - sols2).mean()
         improve = loss >= 0
         if improve and p_value <= 0.05:
             greedy.load_state_dict(model.state_dict())
 
-        print("<TEST ERROR> EPOCH: {:d} AVG LOSS: {:>7f}".format(epoch, loss))
-        return loss
+        print(
+            "<TEST ERROR> EPOCH: {:d}/{:d} AVG LOSS: {:>7f}".format(
+                epoch, tot_epochs, loss
+            )
+        )
+        return model, greedy, loss

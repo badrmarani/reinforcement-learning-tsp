@@ -1,8 +1,19 @@
+import numpy as np
 import torch
 from torch import nn
 
+import sys
+
 dtype = torch.float
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+torch.manual_seed(seed=1234)
+torch.cuda.manual_seed(seed=1234)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+import numpy as np
+
+np.random.seed(1234)
 
 
 class MultiHeadAttention(nn.Module):
@@ -69,11 +80,14 @@ class Encoder(nn.Module):
         )
         self.bn = nn.ModuleList([nn.BatchNorm1d(embed_size) for _ in range(num_layers)])
 
-    def forward(self, x):
+        self.lina = nn.Linear(embed_size, embed_size, bias=False)
+        self.linb = nn.Linear(embed_size, embed_size, bias=False)
+
+    def forward(self, x, clip=10):
         h = self.embedding(x)  # size(num_batchs, num_nodes, embed_size)
+        size = h.size()
         for i in range(self.num_layers):
             h = h + self.attention[i](h)
-            size = h.size()
             # size(num_batchs * num_nodes, embed_size)
             h = h.view(-1, size[-1])
             h = self.bn[i](h)
@@ -91,34 +105,37 @@ class Decoder(nn.Module):
     ) -> None:
         super(Decoder, self).__init__()
         self.greedy = greedy
-        self.initK = nn.Parameter(
-            torch.empty(size=(1, 1, embed_size), device=device, dtype=dtype).uniform_()
-        )
-        self.initV = nn.Parameter(
-            torch.empty(size=(1, 1, embed_size), device=device, dtype=dtype).uniform_()
-        )
+        # self.initK = nn.Parameter(
+        #     torch.empty(size=(1, 1, embed_size), device=device, dtype=dtype).uniform_()
+        # )
+        # self.initV = nn.Parameter(
+        #     torch.empty(size=(1, 1, embed_size), device=device, dtype=dtype).uniform_()
+        # )
+
+        self.lin = nn.Linear(2, embed_size, bias=False)
+
         self.prjK = nn.Linear(embed_size, embed_size, bias=False)
         self.attention = MultiHeadAttention(
             num_heads, embed_size * 3, embed_size, embed_size
         )
 
-    def forward(self, x, clip):
+    def _apply_softmax(self, x):
+        return torch.nn.functional.softmax(x, dim=-1)
+
+    def forward(self, x, P, clip):
         num_batchs, num_nodes, embed_size = x.size()
+        indices = (x.sum(dim=-1, keepdim=True).argsort(dim=1, descending=True)).squeeze(
+            -1
+        )[:, 0]
 
-        hinit = x.mean(dim=-2, keepdim=True)
+        u = P[torch.arange(P.size(0)), indices].unsqueeze(1)
 
-        last = self.initK.repeat(num_batchs, 1, 1)
-        first = self.initV.repeat(num_batchs, 1, 1)
         mask = torch.zeros(
             size=(num_batchs, num_nodes), device=device, dtype=dtype
         ).bool()
         logprob = 0.0
         visited_nodes = []
         for i in range(x.size(1)):
-            h = torch.cat((hinit, last, first), dim=-1)
-
-            q = self.attention(h, x, x, mask, clip=None)
-            u = clip * torch.tanh(q.bmm(self.prjK(x).transpose(-1, -2) / embed_size))
             u = u.masked_fill(mask.unsqueeze(1), float("-inf"))
 
             if self.greedy:
@@ -132,11 +149,29 @@ class Decoder(nn.Module):
             mask = mask.scatter(1, next_node, True)
 
             next_node = next_node.unsqueeze(-1).repeat(1, 1, embed_size)
-            last = torch.gather(x, 1, next_node)
-            if len(visited_nodes) == 1:
-                first = last
+            u = P[torch.arange(P.size(0)), next_node[..., 0].squeeze(-1)].unsqueeze(1)
+
         visited_nodes = torch.cat(visited_nodes, -1)
         return visited_nodes, logprob
+
+
+class Sinkhorn(nn.Module):
+    def __init__(self, reg: float, niters: int) -> None:
+        super(Sinkhorn, self).__init__()
+        self.reg = reg
+        self.niters = niters
+
+    def forward(self, cost):
+        num_batchs, num_nodes, _ = cost.size()
+        K = torch.exp(-self.reg * cost)
+        u = torch.ones(size=(num_batchs, num_nodes)) / num_nodes
+        v = torch.ones(size=(num_batchs, num_nodes)) / num_nodes
+        for _ in range(self.niters):
+            v = 1 / torch.einsum("ki,kij->kj", u, K)
+            u = 1 / torch.einsum("kij,kj->ki", K, v)
+        P = torch.einsum("ki,kij,kj->kij", u, K, v)
+        P = torch.log(P)
+        return P
 
 
 class TSPNet(nn.Module):
@@ -144,13 +179,31 @@ class TSPNet(nn.Module):
         self,
         embed_size,
         num_heads,
+        reg,
+        niters,
         greedy,
     ) -> None:
         super(TSPNet, self).__init__()
         self.encoder = Encoder(10, embed_size, num_heads)
         self.decoder = Decoder(embed_size, num_heads, greedy=greedy)
 
+        self.lina = nn.Linear(embed_size, embed_size, bias=False)
+        self.linb = nn.Linear(embed_size, embed_size, bias=False)
+
+        self.sinkhorn = Sinkhorn(reg, niters)
+
+    def _make_heatmap(self, x, clip=10):
+        # x <- size(num_batchs, num_nodes, embed_size)
+        A = self.lina(x)
+        B = self.linb(x)
+        M = torch.bmm(A, B.transpose(-1, -2)) / A.size(-1)
+        Ptanh = torch.tanh(M) * clip
+        return Ptanh  # size(num_batchs, num_nodes, num_nodes)
+
     def forward(self, instances):
-        out = self.encoder(instances)
-        out = self.decoder(out, clip=10)
-        return out
+        H = self.encoder(instances)
+        P = self._make_heatmap(H)
+        P = self.sinkhorn(P)
+
+        solutions, log_probs = self.decoder(H, P, clip=10)
+        return solutions, log_probs
