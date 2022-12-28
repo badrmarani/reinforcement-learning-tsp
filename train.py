@@ -1,4 +1,4 @@
-from model import TSPNet
+from tsp import TSPNet
 from utils import draw, Trainer
 import torch
 
