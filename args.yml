@@ -1,9 +1,13 @@
 num_epochs: 100
-num_batchs: 2500
-num_instances_per_batchs: 512
-batch_size_val: 50
+batch_size: 2500
+num_instances_per_batch: 512
+batch_size_val: 10000
 num_nodes: 10
 num_heads: 8
 embed_size: 128
 lr: 0.0004
 save_interval: 3
+reg: 2
+num_iters: 1
+device: "cpu"
+parallel: false

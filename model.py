@@ -1,19 +1,18 @@
+import sys
+
 import numpy as np
 import torch
 from torch import nn
 
-import sys
-
 dtype = torch.float
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-torch.manual_seed(seed=1234)
-torch.cuda.manual_seed(seed=1234)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-import numpy as np
+# torch.manual_seed(seed=1234)
+# torch.cuda.manual_seed(seed=1234)
+# torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.benchmark = False
 
-np.random.seed(1234)
+# np.random.seed(1234)
 
 
 class MultiHeadAttention(nn.Module):
@@ -49,6 +48,7 @@ class MultiHeadAttention(nn.Module):
         K = torch.stack(torch.chunk(self.prjK(K), self.num_heads, dim=-1), dim=1)
         V = torch.stack(torch.chunk(self.prjVinp(V), self.num_heads, dim=-1), dim=1)
 
+        # 16 = 128/8 = embed_size/num_heads
         U = torch.matmul(Q, K.transpose(2, 3)) / 16**0.5
 
         if clip is not None:
@@ -101,17 +101,8 @@ class Decoder(nn.Module):
         self,
         embed_size,
         num_heads,
-        greedy,
     ) -> None:
         super(Decoder, self).__init__()
-        self.greedy = greedy
-        # self.initK = nn.Parameter(
-        #     torch.empty(size=(1, 1, embed_size), device=device, dtype=dtype).uniform_()
-        # )
-        # self.initV = nn.Parameter(
-        #     torch.empty(size=(1, 1, embed_size), device=device, dtype=dtype).uniform_()
-        # )
-
         self.lin = nn.Linear(2, embed_size, bias=False)
 
         self.prjK = nn.Linear(embed_size, embed_size, bias=False)
@@ -122,7 +113,7 @@ class Decoder(nn.Module):
     def _apply_softmax(self, x):
         return torch.nn.functional.softmax(x, dim=-1)
 
-    def forward(self, x, P, clip):
+    def forward(self, x, P, clip, greedy):
         num_batchs, num_nodes, embed_size = x.size()
         indices = (x.sum(dim=-1, keepdim=True).argsort(dim=1, descending=True)).squeeze(
             -1
@@ -136,9 +127,7 @@ class Decoder(nn.Module):
         logprob = 0.0
         visited_nodes = []
         for i in range(x.size(1)):
-            u = u.masked_fill(mask.unsqueeze(1), float("-inf"))
-
-            if self.greedy:
+            if greedy:
                 next_node = u.argmax(dim=-1)
             else:
                 m = torch.distributions.Categorical(logits=u)
@@ -150,6 +139,7 @@ class Decoder(nn.Module):
 
             next_node = next_node.unsqueeze(-1).repeat(1, 1, embed_size)
             u = P[torch.arange(P.size(0)), next_node[..., 0].squeeze(-1)].unsqueeze(1)
+            u = u.masked_fill(mask.unsqueeze(1), float("-inf"))
 
         visited_nodes = torch.cat(visited_nodes, -1)
         return visited_nodes, logprob
@@ -174,7 +164,7 @@ class Sinkhorn(nn.Module):
         return P
 
 
-class TSPNet(nn.Module):
+class TSP(nn.Module):
     def __init__(
         self,
         embed_size,
@@ -183,9 +173,10 @@ class TSPNet(nn.Module):
         niters,
         greedy,
     ) -> None:
-        super(TSPNet, self).__init__()
+        super(TSP, self).__init__()
+
         self.encoder = Encoder(10, embed_size, num_heads)
-        self.decoder = Decoder(embed_size, num_heads, greedy=greedy)
+        self.decoder = Decoder(embed_size, num_heads)
 
         self.lina = nn.Linear(embed_size, embed_size, bias=False)
         self.linb = nn.Linear(embed_size, embed_size, bias=False)
@@ -200,10 +191,9 @@ class TSPNet(nn.Module):
         Ptanh = torch.tanh(M) * clip
         return Ptanh  # size(num_batchs, num_nodes, num_nodes)
 
-    def forward(self, instances):
+    def forward(self, instances, greedy):
         H = self.encoder(instances)
         P = self._make_heatmap(H)
         P = self.sinkhorn(P)
-
-        solutions, log_probs = self.decoder(H, P, clip=10)
+        solutions, log_probs = self.decoder(H, P, clip=10, greedy=greedy)
         return solutions, log_probs

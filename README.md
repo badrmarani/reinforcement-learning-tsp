@@ -1,6 +1,27 @@
-# Solving the TSP using Reinforcement Learning and Optimal Transport
+# Solving TSP using Reinforcement Learning and Optimal Transport
 
-This repository contains a PyTorch implementation of the paper: [Combining Reinforcement Learning and Optimal Transport for the Traveling Salesman Problem](https://arxiv.org/abs/2203.00903).
+This repository contains a PyTorch implementation of the papers: [Combining Reinforcement Learning and Optimal Transport for the Traveling Salesman Problem](https://arxiv.org/abs/2203.00903).
+
+## Requirements
+
+```sh
+python -m pip install -r requirements.txt
+```
+
+## Training a new model
+
+First change the parameters on `args.yml` and then run the following command:
+
+```sh
+python train.py
+```
+
+Once the model is trained, run:
+
+```sh
+python -m jupyter nbconvert --to python demo.ipynb
+python demo.py
+```
 
 ## References
 
