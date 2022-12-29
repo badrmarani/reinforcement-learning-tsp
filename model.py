@@ -76,9 +76,12 @@ class Encoder(nn.Module):
         self.num_layers = num_layers
         self.embedding = nn.Linear(2, embed_size)
         self.attention = nn.ModuleList(
-            [MultiHeadAttention(num_heads, embed_size) for _ in range(num_layers)]
+            [MultiHeadAttention(num_heads, embed_size)
+            for _ in range(num_layers)]
         )
-        self.bn = nn.ModuleList([nn.BatchNorm1d(embed_size) for _ in range(num_layers)])
+        self.bn = nn.ModuleList([
+            nn.BatchNorm1d(embed_size)
+            for _ in range(num_layers)])
 
         self.lina = nn.Linear(embed_size, embed_size, bias=False)
         self.linb = nn.Linear(embed_size, embed_size, bias=False)
@@ -154,8 +157,8 @@ class Sinkhorn(nn.Module):
     def forward(self, cost):
         num_batchs, num_nodes, _ = cost.size()
         K = torch.exp(-self.reg * cost)
-        u = torch.ones(size=(num_batchs, num_nodes)) / num_nodes
-        v = torch.ones(size=(num_batchs, num_nodes)) / num_nodes
+        u = torch.ones(size=(num_batchs, num_nodes), device=device) / num_nodes
+        v = torch.ones(size=(num_batchs, num_nodes), device=device) / num_nodes
         for _ in range(self.niters):
             v = 1 / torch.einsum("ki,kij->kj", u, K)
             u = 1 / torch.einsum("kij,kj->ki", K, v)
@@ -171,11 +174,10 @@ class TSP(nn.Module):
         num_heads,
         reg,
         niters,
-        greedy,
     ) -> None:
         super(TSP, self).__init__()
 
-        self.encoder = Encoder(10, embed_size, num_heads)
+        self.encoder = Encoder(3, embed_size, num_heads)
         self.decoder = Decoder(embed_size, num_heads)
 
         self.lina = nn.Linear(embed_size, embed_size, bias=False)
